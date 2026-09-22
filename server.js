@@ -18,12 +18,18 @@ app.use(express.json({ limit: '10mb' }));
 app.use(morgan('dev'));
 
 // =====================
-// AI CLIENTS (Multi-Provider)
+// FEATURE FLAGS
+// =====================
+const ENABLE_TEXT_AI = process.env.ENABLE_TEXT_AI === 'true';
+const ENABLE_IMAGE_AI = process.env.ENABLE_IMAGE_AI === 'true';
+
+// =====================
+// AI CLIENTS
 // =====================
 const aiClient = new OpenAI({
-  apiKey: process.env.AI_API_KEY,
+  apiKey: process.env.AI_API_KEY || 'not-configured',
   baseURL: process.env.AI_BASE_URL || 'https://agentrouter.org/v1',
-  timeout: 90000,
+  timeout: 8000,
   defaultHeaders: {
     'User-Agent': process.env.AI_USER_AGENT || 'codex_cli_rs/0.101.0',
     'Originator': 'codex_cli_rs',
@@ -31,80 +37,42 @@ const aiClient = new OpenAI({
   }
 });
 
-// KeylessAI - no API key needed, works on cloud IPs
-const keylessClient = new OpenAI({
-  apiKey: 'not-needed',
-  baseURL: process.env.KEYLESS_BASE_URL || 'https://keylessai.thryx.workers.dev/v1',
-  timeout: 60000
-});
-
-// Groq (optional)
 const groqClient = process.env.GROQ_API_KEY ? new OpenAI({
   apiKey: process.env.GROQ_API_KEY,
   baseURL: process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1',
-  timeout: 60000
+  timeout: 15000
 }) : null;
 
+const keylessClient = new OpenAI({
+  apiKey: 'not-needed',
+  baseURL: process.env.KEYLESS_BASE_URL || 'https://keylessai.thryx.workers.dev/v1',
+  timeout: 8000
+});
+
 console.log('\n🤖 AI Configuration:');
-console.log('   Primary: KeylessAI');
-console.log('   Fallback 1: Agent Router (' + (process.env.AI_MODEL || 'glm-5.3') + ')');
-console.log('   Fallback 2:', groqClient ? 'Groq' : '❌ not configured');
+console.log('   Text AI:', ENABLE_TEXT_AI ? '✅ ENABLED' : '⏸️  DISABLED (using templates)');
+console.log('   Image AI:', ENABLE_IMAGE_AI ? '✅ ENABLED' : '⏸️  DISABLED (using SVG render)');
+console.log('   Providers:', [
+  groqClient ? 'Groq' : null,
+  'KeylessAI',
+  'Agent Router'
+].filter(Boolean).join(' → '));
 console.log('');
 
 // =====================
-// TEXT PROVIDER FALLBACK CHAIN
+// TEXT PROVIDER CHAIN
 // =====================
 async function callTextAI(messages, options = {}) {
+  if (!ENABLE_TEXT_AI) {
+    return { success: false, error: 'Text AI disabled' };
+  }
+
   const { temperature = 0.2, max_tokens = 4000 } = options;
 
-  // ====================================
-  // PROVIDER 1: KeylessAI (works on cloud IPs)
-  // ====================================
-  try {
-    console.log('📡 Text Provider 1: KeylessAI...');
-    const response = await keylessClient.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages,
-      temperature,
-      max_tokens: Math.min(max_tokens, 2000)
-    });
-    const content = response.choices?.[0]?.message?.content;
-    if (content && content.length > 10) {
-      console.log('✅ KeylessAI success');
-      return { success: true, content, provider: 'keylessai' };
-    }
-    console.log('⚠️ KeylessAI returned empty content');
-  } catch (err) {
-    console.log('❌ KeylessAI failed:', err.message);
-  }
-
-  // ====================================
-  // PROVIDER 2: Agent Router (works locally)
-  // ====================================
-  try {
-    console.log('📡 Text Provider 2: Agent Router...');
-    const response = await aiClient.chat.completions.create({
-      model: process.env.AI_MODEL || 'glm-5.3',
-      messages,
-      temperature,
-      max_tokens
-    });
-    const content = response.choices?.[0]?.message?.content;
-    if (content && content.length > 10) {
-      console.log('✅ Agent Router success');
-      return { success: true, content, provider: 'agent-router' };
-    }
-    console.log('⚠️ Agent Router returned empty content');
-  } catch (err) {
-    console.log('❌ Agent Router failed:', err.message);
-  }
-
-  // ====================================
-  // PROVIDER 3: Groq (optional)
-  // ====================================
+  // Provider 1: Groq (if configured)
   if (groqClient) {
     try {
-      console.log('📡 Text Provider 3: Groq...');
+      console.log('📡 Provider 1: Groq...');
       const response = await groqClient.chat.completions.create({
         model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
         messages,
@@ -121,30 +89,43 @@ async function callTextAI(messages, options = {}) {
     }
   }
 
-  return { success: false, error: 'All text providers failed' };
-}
-
-// =====================
-// HELPER: Extract content safely
-// =====================
-function extractAIContent(response) {
-  if (typeof response === 'string') {
-    try { response = JSON.parse(response); } catch (e) { return null; }
-  }
-  if (!response?.choices || !Array.isArray(response.choices) || response.choices.length === 0) {
-    return null;
-  }
-  const choice = response.choices[0];
-  if (!choice?.message) return null;
-  const content = choice.message.content;
-  if (!content || content.length < 10) {
-    const reasoning = choice.message.reasoning_content;
-    if (reasoning) {
-      console.error('⚠️ Content empty, stuck in reasoning. Length:', reasoning.length);
+  // Provider 2: KeylessAI
+  try {
+    console.log('📡 Provider 2: KeylessAI...');
+    const response = await keylessClient.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages,
+      temperature,
+      max_tokens: Math.min(max_tokens, 2000)
+    });
+    const content = response.choices?.[0]?.message?.content;
+    if (content && content.length > 10) {
+      console.log('✅ KeylessAI success');
+      return { success: true, content, provider: 'keylessai' };
     }
-    return null;
+  } catch (err) {
+    console.log('❌ KeylessAI failed:', err.message);
   }
-  return content;
+
+  // Provider 3: Agent Router
+  try {
+    console.log('📡 Provider 3: Agent Router...');
+    const response = await aiClient.chat.completions.create({
+      model: process.env.AI_MODEL || 'glm-5.3',
+      messages,
+      temperature,
+      max_tokens
+    });
+    const content = response.choices?.[0]?.message?.content;
+    if (content && content.length > 10) {
+      console.log('✅ Agent Router success');
+      return { success: true, content, provider: 'agent-router' };
+    }
+  } catch (err) {
+    console.log('❌ Agent Router failed:', err.message);
+  }
+
+  return { success: false, error: 'All text providers failed' };
 }
 
 // =====================
@@ -153,11 +134,15 @@ function extractAIContent(response) {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    ai_configured: true,
-    primary_provider: 'keylessai',
-    fallback_1: 'agent-router',
-    fallback_2: groqClient ? 'groq' : null,
-    model: process.env.AI_MODEL || 'glm-5.3'
+    text_ai_enabled: ENABLE_TEXT_AI,
+    image_ai_enabled: ENABLE_IMAGE_AI,
+    template_mode: !ENABLE_TEXT_AI,
+    providers: [
+      groqClient ? 'groq' : null,
+      'keylessai',
+      'agent-router'
+    ].filter(Boolean),
+    model: process.env.AI_MODEL
   });
 });
 
@@ -165,28 +150,29 @@ app.get('/api/health', (req, res) => {
 // TEST AI
 // =====================
 app.get('/api/test-ai', async (req, res) => {
-  console.log('\n🧪 Testing AI with fallback chain...');
+  if (!ENABLE_TEXT_AI) {
+    return res.json({
+      success: true,
+      mode: 'template',
+      message: 'Text AI is disabled. Using template-based generation.',
+      hint: 'Set ENABLE_TEXT_AI=true in .env to activate AI'
+    });
+  }
+
+  console.log('\n🧪 Testing AI...');
   const result = await callTextAI([
     { role: 'user', content: 'Reply with exactly: AI is working!' }
   ], { max_tokens: 50 });
 
   if (result.success) {
-    res.json({
-      success: true,
-      provider: result.provider,
-      response: result.content
-    });
+    res.json({ success: true, provider: result.provider, response: result.content });
   } else {
-    res.status(500).json({
-      success: false,
-      error: result.error,
-      tried: ['keylessai', 'agent-router', groqClient ? 'groq' : null].filter(Boolean)
-    });
+    res.json({ success: false, error: result.error, fallback: 'template' });
   }
 });
 
 // =====================
-// GENERATE BLUEPRINT (JSON)
+// GENERATE BLUEPRINT
 // =====================
 app.post('/api/generate-blueprint', async (req, res) => {
   try {
@@ -206,8 +192,21 @@ app.post('/api/generate-blueprint', async (req, res) => {
     console.log('🏠 Building:', normalizedData.buildingType);
     console.log('🌍 Country:', country);
     console.log('🛏️ Bedrooms:', normalizedData.bedrooms);
-    console.log('📐 Land:', normalizedData.landSize.width, 'x', normalizedData.landSize.depth);
+    console.log('⚙️  Mode:', ENABLE_TEXT_AI ? 'AI + template fallback' : 'Template only');
 
+    // If AI is disabled → use template immediately (fast!)
+    if (!ENABLE_TEXT_AI) {
+      const template = generateTemplateBlueprint(normalizedData, country, customizations);
+      console.log(`🎨 Template generated: ${template.rooms.length} rooms`);
+      return res.json({
+        success: true,
+        data: template,
+        source: 'template',
+        note: 'AI disabled — using template-based generation'
+      });
+    }
+
+    // AI enabled → try AI, fallback to template
     const prompt = buildBlueprintPrompt(normalizedData, country);
 
     const result = await callTextAI([
@@ -219,7 +218,7 @@ app.post('/api/generate-blueprint', async (req, res) => {
     ], { temperature: 0.2, max_tokens: 4000 });
 
     if (!result.success) {
-      console.log('🔄 All text providers failed → template fallback');
+      console.log('🔄 AI failed → template fallback');
       return res.json({
         success: true,
         data: generateTemplateBlueprint(normalizedData, country, customizations),
@@ -227,8 +226,7 @@ app.post('/api/generate-blueprint', async (req, res) => {
       });
     }
 
-    console.log(`✅ AI content received from ${result.provider}. Length: ${result.content.length}`);
-
+    // Parse AI response
     let blueprint;
     try {
       let cleaned = result.content.trim();
@@ -238,15 +236,11 @@ app.post('/api/generate-blueprint', async (req, res) => {
       blueprint = JSON.parse(cleaned);
     } catch (e) {
       const jsonMatch = result.content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        blueprint = JSON.parse(jsonMatch[0]);
-      } else {
-        throw new Error('AI returned no JSON');
-      }
+      blueprint = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
     }
 
-    if (!blueprint.rooms || !Array.isArray(blueprint.rooms) || blueprint.rooms.length === 0) {
-      console.log('⚠️ Missing rooms → template fallback');
+    if (!blueprint?.rooms?.length) {
+      console.log('⚠️ Invalid AI JSON → template fallback');
       return res.json({
         success: true,
         data: generateTemplateBlueprint(normalizedData, country, customizations),
@@ -254,7 +248,7 @@ app.post('/api/generate-blueprint', async (req, res) => {
       });
     }
 
-    // Ensure every bedroom has a bathroom
+    // Ensure ensuite bathrooms
     const bedCount = blueprint.rooms.filter(r => r.type === 'bedroom').length;
     const bathCount = blueprint.rooms.filter(r => r.type === 'bathroom').length;
     if (bedCount > bathCount) {
@@ -272,7 +266,7 @@ app.post('/api/generate-blueprint', async (req, res) => {
       }
     }
 
-    console.log(`🎉 Blueprint generated via ${result.provider}: ${blueprint.rooms.length} rooms`);
+    console.log(`🎉 AI generated (${result.provider}): ${blueprint.rooms.length} rooms`);
     res.json({
       success: true,
       data: blueprint,
@@ -288,11 +282,7 @@ app.post('/api/generate-blueprint', async (req, res) => {
         req.body.country,
         req.body.customizations
       );
-      res.json({
-        success: true,
-        data: fallback,
-        source: 'template-fallback'
-      });
+      res.json({ success: true, data: fallback, source: 'template-fallback' });
     } catch (fallbackError) {
       res.status(500).json({ success: false, error: error.message });
     }
@@ -303,111 +293,40 @@ app.post('/api/generate-blueprint', async (req, res) => {
 // GENERATE BLUEPRINT IMAGE
 // =====================
 app.post('/api/generate-blueprint-image', async (req, res) => {
+  if (!ENABLE_IMAGE_AI) {
+    return res.status(200).json({
+      success: false,
+      disabled: true,
+      message: 'Image AI is disabled. Use the SVG renderer in the frontend.',
+      hint: 'The frontend SVGBlueprintViewer renders blueprints from JSON — no external image API needed'
+    });
+  }
+
   try {
     const { buildingData, country } = req.body;
     const bedrooms = buildingData?.bedrooms || buildingData?.roomCount?.bedrooms || 3;
 
-    console.log('\n🖼️ === AI IMAGE GENERATION REQUEST ===');
-    console.log('🏠 Building:', buildingData?.buildingType);
+    console.log('\n🖼️ === AI IMAGE REQUEST ===');
 
     const prompt = buildImagePrompt(buildingData, country, bedrooms);
-
     let imageBase64 = null;
     let usedMethod = null;
 
-    // Path 1: Responses API (15s timeout)
-    try {
-      console.log('🔧 Path 1: Responses API...');
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000);
-
-      const response = await fetch(`${process.env.AI_BASE_URL}/responses`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.AI_API_KEY}`,
-          'User-Agent': process.env.AI_USER_AGENT || 'codex_cli_rs/0.101.0',
-          'Originator': 'codex_cli_rs',
-          'Version': '0.101.0'
-        },
-        body: JSON.stringify({
-          model: process.env.AI_MODEL,
-          input: prompt,
-          tools: [{ type: 'image_generation' }]
-        }),
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-
-      if (response.ok) {
-        const data = await response.json();
-        const output = data.output || [];
-        for (const item of output) {
-          if (item.type === 'image_generation_call' && item.result) {
-            imageBase64 = item.result;
-            usedMethod = 'responses-api';
-            console.log('✅ Image from Responses API');
-            break;
-          }
-        }
-      } else {
-        console.log(`❌ Path 1 failed [${response.status}]`);
-      }
-    } catch (err) {
-      console.log('❌ Path 1 error:', err.name === 'AbortError' ? 'Timeout' : err.message);
-    }
-
-    // Path 2: Cloudflare Workers AI (if configured)
-    if (!imageBase64 && process.env.CLOUDFLARE_ACCOUNT_ID && process.env.CLOUDFLARE_API_TOKEN) {
-      try {
-        console.log('🔧 Path 2: Cloudflare Workers AI...');
-        const cfUrl = `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell`;
-
-        const response = await fetch(cfUrl, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            prompt,
-            num_steps: 4
-          })
-        });
-
-        if (response.ok) {
-          const arrayBuffer = await response.arrayBuffer();
-          imageBase64 = Buffer.from(arrayBuffer).toString('base64');
-          usedMethod = 'cloudflare-flux';
-          console.log('✅ Image from Cloudflare FLUX');
-        } else {
-          console.log(`❌ Cloudflare failed [${response.status}]`);
-        }
-      } catch (err) {
-        console.log('❌ Cloudflare error:', err.message);
-      }
-    }
-
-    // Path 3: Pollinations.ai with retry
+    // Path 1: Pollinations (retry with backoff)
     if (!imageBase64) {
-      console.log('🔧 Path 3: Pollinations.ai with retry...');
+      console.log('🔧 Pollinations.ai with retry...');
       const encodedPrompt = encodeURIComponent(prompt);
       const seed = Math.floor(Math.random() * 999999);
       const pollinationsUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1024&height=1024&nologo=true&model=flux&seed=${seed}`;
 
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          console.log(`   Attempt ${attempt}/3...`);
-          await new Promise(r => setTimeout(r, Math.random() * 2000));
-
           const controller = new AbortController();
           const timeoutId = setTimeout(() => controller.abort(), 45000);
 
           const response = await fetch(pollinationsUrl, {
             signal: controller.signal,
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (compatible; BlueprintGenerator/1.0)'
-            }
+            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; BlueprintGenerator/1.0)' }
           });
           clearTimeout(timeoutId);
 
@@ -416,34 +335,26 @@ app.post('/api/generate-blueprint-image', async (req, res) => {
             if (buffer.byteLength > 5000) {
               imageBase64 = Buffer.from(buffer).toString('base64');
               usedMethod = 'pollinations';
-              console.log('✅ Image from Pollinations.ai');
+              console.log('✅ Image from Pollinations');
               break;
-            } else {
-              console.log('   Response too small, retrying...');
             }
           } else if (response.status === 429) {
-            console.log(`   429 rate limit — waiting...`);
             await new Promise(r => setTimeout(r, 3000 * attempt));
-          } else {
-            console.log(`   Failed [${response.status}]`);
           }
         } catch (err) {
-          console.log(`   Attempt ${attempt} error:`, err.name === 'AbortError' ? 'Timeout' : err.message);
           if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
         }
       }
     }
 
     if (!imageBase64) {
-      console.error('❌ All image paths failed');
-      return res.status(500).json({
+      return res.status(503).json({
         success: false,
-        error: 'Image generation unavailable. Please try again in a few minutes.',
-        tried: ['responses-api', 'cloudflare-flux', 'pollinations']
+        error: 'Image generation unavailable',
+        fallback: 'svg'
       });
     }
 
-    console.log(`🎉 Image generated via: ${usedMethod}`);
     res.json({
       success: true,
       imageBase64: `data:image/png;base64,${imageBase64}`,
@@ -451,8 +362,8 @@ app.post('/api/generate-blueprint-image', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Image endpoint error:', error.message);
-    res.status(500).json({ success: false, error: error.message });
+    console.error('❌ Image error:', error.message);
+    res.status(500).json({ success: false, error: error.message, fallback: 'svg' });
   }
 });
 
@@ -501,17 +412,14 @@ function buildImagePrompt(buildingData, country, bedrooms) {
   const buildingType = buildingData?.buildingType || 'house';
   const landW = buildingData?.landSize?.width || 50;
   const landD = buildingData?.landSize?.depth || 60;
-  const guestToilet = buildingData?.guestToilet?.hasGuestToilet;
-  const description = buildingData?.description || '';
-
-  return `Professional architectural blueprint floor plan, top-down view, of a ${buildingType} with ${bedrooms} bedrooms on a ${landW} x ${landD} feet plot in ${country}. Classic blueprint style, deep blue background, white and cyan technical lines, room labels, dimension annotations, door swings, window symbols, title block, north arrow, scale bar. Include living room, kitchen, dining area, hallways, ${bedrooms} bedrooms each with attached bathroom${guestToilet ? ', guest toilet' : ''}. Engineering-quality technical drawing, no overlapping rooms.${description ? ` Client notes: ${description}` : ''}`;
+  return `Professional architectural blueprint floor plan, top-down view, of a ${buildingType} with ${bedrooms} bedrooms on ${landW} x ${landD} feet plot in ${country}. Classic blueprint style, deep blue background, white technical lines, room labels, dimensions, door swings, window symbols, title block, north arrow, scale bar. Engineering-quality technical drawing.`;
 }
 
 // =====================
-// TEMPLATE FALLBACK
+// TEMPLATE GENERATOR (Always Reliable)
 // =====================
 function generateTemplateBlueprint(data, country, customizations) {
-  const bedrooms = data?.bedrooms || data?.roomCount?.bedrooms || 3;
+  const bedrooms = data?.bedrooms || 3;
   const landWidth = data?.landSize?.width || 50;
   const landDepth = data?.landSize?.depth || 60;
   const guestToilet = data?.guestToilet;
@@ -520,6 +428,7 @@ function generateTemplateBlueprint(data, country, customizations) {
   const rooms = [];
   let x = 10, y = 10;
 
+  // Living Room
   rooms.push({
     id: 'room-living', name: 'Living Room', type: 'living',
     width: 16, depth: 20, area: 320,
@@ -529,6 +438,7 @@ function generateTemplateBlueprint(data, country, customizations) {
   });
   x += 21;
 
+  // Kitchen
   rooms.push({
     id: 'room-kitchen', name: 'Kitchen', type: 'kitchen',
     width: 12, depth: 15, area: 180,
@@ -538,6 +448,7 @@ function generateTemplateBlueprint(data, country, customizations) {
   });
   x += 17;
 
+  // Dining
   rooms.push({
     id: 'room-dining', name: 'Dining Area', type: 'dining',
     width: 12, depth: 14, area: 168,
@@ -546,6 +457,7 @@ function generateTemplateBlueprint(data, country, customizations) {
     windows: [{ wall: 'north', position: 0.5, width: 4 }]
   });
 
+  // Bedrooms with ensuite
   x = 10; y = 35;
   for (let i = 0; i < bedrooms; i++) {
     const isMaster = i === 0;
@@ -576,6 +488,7 @@ function generateTemplateBlueprint(data, country, customizations) {
     if (x > 50) { x = 10; y += 20; }
   }
 
+  // Guest toilet
   if (guestToilet?.hasGuestToilet) {
     rooms.push({
       id: 'room-guest-toilet', name: 'Guest Toilet', type: 'bathroom',
@@ -586,6 +499,7 @@ function generateTemplateBlueprint(data, country, customizations) {
     });
   }
 
+  // Apply professional customizations
   if (customizations?.roomSizes) {
     rooms.forEach(room => {
       const custom = customizations.roomSizes[room.type];
@@ -612,10 +526,10 @@ function generateTemplateBlueprint(data, country, customizations) {
 }
 
 // =====================
-// START SERVER
+// START
 // =====================
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📍 Health: http://localhost:${PORT}/api/health`);
-  console.log(`🧪 Test AI: http://localhost:${PORT}/api/test-ai\n`);
+  console.log(`🧪 Test: http://localhost:${PORT}/api/test-ai\n`);
 });
